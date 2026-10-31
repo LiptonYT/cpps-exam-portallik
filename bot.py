@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import sqlite3
 from datetime import datetime, timezone
 
 import discord
@@ -17,6 +18,7 @@ GUILD_ID = 1533075462383730838
 REVIEW_CHANNEL_ID = 1533076154783764663
 FIRED_ROLE_ID = 1533075835097976893
 SENIOR_ROLE_ID = 1533075692785504327
+DB_PATH = os.getenv("DB_PATH", "resignations.sqlite3")
 
 if not TOKEN:
     raise RuntimeError(
@@ -63,29 +65,80 @@ def get_applicant_id(embed: discord.Embed) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def get_game_nickname(embed: discord.Embed) -> str | None:
+    """Read the submitted in-game full name from the formal application text."""
+    description = embed.description or ""
+    match = re.search(r"Я,\s*(.+?),\s*находящийся в звании", description, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return discord.utils.escape_markdown(match.group(1).strip())
+
+
+def next_application_number() -> int:
+    """Persistent sequential application number, safe across bot restarts."""
+    with sqlite3.connect(DB_PATH, timeout=10) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT OR IGNORE INTO counters(name, value) VALUES ('resignation', 0)"
+        )
+        connection.execute(
+            "UPDATE counters SET value = value + 1 WHERE name = 'resignation'"
+        )
+        row = connection.execute(
+            "SELECT value FROM counters WHERE name = 'resignation'"
+        ).fetchone()
+        connection.commit()
+        return int(row[0])
+
+
 def make_application_embed(
     applicant: discord.Member,
+    application_number: int,
     nickname: str,
     static_id: str,
     rank: str,
     reason: str,
 ) -> discord.Embed:
+    submitted_at = datetime.now(timezone.utc)
+    joined_at = applicant.joined_at
+    joined_text = (
+        f"<t:{int(joined_at.timestamp())}:f> (<t:{int(joined_at.timestamp())}:R>)"
+        if joined_at else "Неизвестно"
+    )
+
+    # The body follows the formal application layout from the reference image.
+    description = (
+        f"**Пользователь:** {applicant.mention}\n"
+        f"**ID:** `{applicant.id}`\n"
+        f"**Присоединился:** {joined_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Начальнику Управления ГИБДД ГУ МВД по г. Москве и Московской области "
+        "Генерал-полковнику полиции\n"
+        f"<@&{SENIOR_ROLE_ID}>\n\n"
+        f"от **{rank} {nickname}**\n\n"
+        "**Заявление**\n\n"
+        f"Я, {nickname}, находящийся в звании {rank}, служебное удостоверение "
+        f"№ {static_id}, прошу Вас рассмотреть моё заявление на увольнение из рядов "
+        "Управления Государственной Инспекции Безопасности Дорожного Движения "
+        f"по причине: {reason}.\n\n"
+        f"**Дата:** <t:{int(submitted_at.timestamp())}:d>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "**Статус:** 🟠 Ожидает рассмотрения"
+    )
+
     embed = discord.Embed(
-        title="Заявление на увольнение",
-        color=discord.Color.from_rgb(230, 145, 45),
-        timestamp=datetime.now(timezone.utc),
+        title=f"Заявление на увольнение №{application_number}",
+        description=description,
+        color=discord.Color.from_rgb(54, 83, 73),
+        timestamp=submitted_at,
     )
-    embed.add_field(
-        name="Пользователь Discord",
-        value=f"{applicant.mention} (`{applicant.id}`)",
-        inline=False,
+    embed.set_thumbnail(url=applicant.display_avatar.url)
+    embed.set_footer(
+        text=f"ГИБДД | RMRP «Тверской» • Applicant ID: {applicant.id}"
     )
-    embed.add_field(name="Игровой никнейм", value=nickname, inline=True)
-    embed.add_field(name="Static ID", value=static_id, inline=True)
-    embed.add_field(name="Текущее звание", value=rank, inline=True)
-    embed.add_field(name="Причина увольнения", value=reason, inline=False)
-    embed.add_field(name="Статус", value="🟠 Ожидает рассмотрения", inline=False)
-    embed.set_footer(text=f"Система увольнений • Applicant ID: {applicant.id}")
     return embed
 
 
@@ -97,20 +150,19 @@ async def update_review_message(
     if not interaction.message or not interaction.message.embeds:
         return
     embed = interaction.message.embeds[0].copy()
-    # Replace the status field while preserving all application details.
-    status_index = next(
-        (i for i, field in enumerate(embed.fields) if field.name == "Статус"),
-        None,
-    )
-    if status_index is not None:
-        embed.set_field_at(
-            status_index,
-            name="Статус",
-            value=status_text,
-            inline=False,
-        )
+    description = embed.description or ""
+    marker = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n**Статус:**"
+    marker_index = description.rfind(marker)
+    if marker_index >= 0:
+        description = description[:marker_index]
     else:
-        embed.add_field(name="Статус", value=status_text, inline=False)
+        # Fallback for applications created by an older version of the bot.
+        status_index = description.rfind("**Статус:**")
+        if status_index >= 0:
+            description = description[:status_index]
+        else:
+            description += "\n\n"
+    embed.description = description + marker + " " + status_text
     embed.color = color
     await interaction.message.edit(embed=embed, view=None)
 
@@ -164,8 +216,10 @@ class ResignationModal(discord.ui.Modal, title="Заявление на увол
 
         try:
             channel = await get_review_channel(interaction.guild)
+            application_number = next_application_number()
             embed = make_application_embed(
                 interaction.user,
+                application_number,
                 str(self.nickname.value).strip(),
                 str(self.static_id.value).strip(),
                 str(self.rank.value).strip(),
@@ -310,9 +364,46 @@ class ReviewView(discord.ui.View):
                     reason=f"Resignation approved by {interaction.user} ({interaction.user.id})",
                 )
 
+            # Rename the member on this Discord server to "Уволен | Имя Фамилия".
+            # Discord server nicknames are limited to 32 characters.
+            game_full_name = get_game_nickname(interaction.message.embeds[0])
+            nickname_result = ""
+            if game_full_name:
+                new_nickname = f"Уволен | {game_full_name}"[:32]
+                try:
+                    await member.edit(
+                        nick=new_nickname,
+                        reason=f"Resignation approved by {interaction.user} ({interaction.user.id})",
+                    )
+                    nickname_result = f"\n**Новое имя в Discord:** `{new_nickname}`"
+                except discord.Forbidden:
+                    nickname_result = (
+                        "\n⚠️ **Имя не изменено:** боту не хватает права «Управлять никнеймами» "
+                        "или его роль ниже роли сотрудника."
+                    )
+                except discord.HTTPException as nick_error:
+                    log.warning("Could not change nickname for %s: %s", applicant_id, nick_error)
+                    nickname_result = "\n⚠️ Не удалось автоматически изменить имя в Discord."
+            else:
+                nickname_result = "\n⚠️ Игровое имя не найдено в тексте заявления."
+
+            removed_role_names = [role.name for role in roles_to_remove]
+            if removed_role_names:
+                removed_roles_text = ", ".join(removed_role_names)
+                if len(removed_roles_text) > 1200:
+                    removed_roles_text = removed_roles_text[:1197] + "..."
+            else:
+                removed_roles_text = "Служебных ролей для снятия не было."
+
             await update_review_message(
                 interaction,
-                f"✅ Одобрено — {interaction.user.mention}\nРоль «Уволен» выдана, доступные роли сняты.",
+                (
+                    f"🟢 Одобрено {interaction.user.mention}\n"
+                    "**Сотрудник уволен.**\n"
+                    f"**Сняты роли:** {removed_roles_text}"
+                    f"{nickname_result}\n"
+                    "**Итоговый статус:** Уволен"
+                ),
                 discord.Color.green(),
             )
             await notify_applicant(
@@ -375,7 +466,7 @@ class ReviewView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         await update_review_message(
             interaction,
-            f"❌ Отклонено — {interaction.user.mention}",
+            f"🔴 Отклонено {interaction.user.mention}",
             discord.Color.red(),
         )
         await notify_applicant(
