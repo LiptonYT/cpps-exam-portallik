@@ -1,207 +1,193 @@
 import os
-import sqlite3
+import re
 import logging
 from datetime import datetime, timezone
 
 import discord
-from discord.ext import commands
 from discord import app_commands
-from dotenv import load_dotenv
+from discord.ext import commands
 
-load_dotenv()
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("termination-bot")
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# Bothost exposes its built-in token as BOT_TOKEN. Prefer it over custom
-# variables so an outdated DISCORD_TOKEN cannot override the current token.
-TOKEN = (
-    os.getenv("BOT_TOKEN")
-    or os.getenv("DISCORD_TOKEN")
-    or os.getenv("DISCORD_BOT_TOKEN")
-    or ""
-).strip()
-# Accept either a raw Discord token or the common "Bot <token>" form.
-if TOKEN.lower().startswith("bot "):
-    TOKEN = TOKEN[4:].strip()
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
-REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", "0") or 0)
-TERMINATED_ROLE_ID = int(os.getenv("TERMINATED_ROLE_ID", "0") or 0)
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
-REVIEWER_ROLE_IDS = {
-    int(x.strip()) for x in os.getenv("REVIEWER_ROLE_IDS", "").split(",")
-    if x.strip().isdigit()
-}
-DB_PATH = os.getenv("DB_PATH", "/app/data/terminations.sqlite3")
-if os.path.dirname(DB_PATH):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+GUILD_ID = 1533075462383730838
+REVIEW_CHANNEL_ID = 1533076154783764663
+FIRED_ROLE_ID = 1533075835097976893
+SENIOR_ROLE_ID = 1533075692785504327
 
 if not TOKEN:
-    raise RuntimeError("Не задан токен: укажите BOT_TOKEN или DISCORD_TOKEN в переменных хостинга")
+    raise RuntimeError(
+        "DISCORD_TOKEN is missing. Add the bot token as the DISCORD_TOKEN "
+        "environment variable in your hosting panel."
+    )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("lipton-resignation")
+
+# Members intent is required to fetch members and change their roles.
 intents = discord.Intents.default()
-intents.members = True
 intents.guilds = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-db = sqlite3.connect(DB_PATH)
-db.row_factory = sqlite3.Row
-db.execute("""
-CREATE TABLE IF NOT EXISTS applications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    game_nick TEXT NOT NULL,
-    static_id TEXT NOT NULL,
-    rank TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    review_message_id INTEGER,
-    reviewer_id INTEGER,
-    created_at TEXT NOT NULL,
-    reviewed_at TEXT,
-    member_joined_at TEXT
-)
-""")
-db.commit()
-columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)").fetchall()}
-if "member_joined_at" not in columns:
-    db.execute("ALTER TABLE applications ADD COLUMN member_joined_at TEXT")
-    db.commit()
 
 
-def reviewer_allowed(member: discord.Member) -> bool:
+# ============================================================
+# HELPERS
+# ============================================================
+
+def has_reviewer_access(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
-    return any(role.id in REVIEWER_ROLE_IDS for role in member.roles)
+    return any(role.id == SENIOR_ROLE_ID for role in member.roles)
 
 
-def make_embed(row, status="pending", member=None):
-    colors = {
-        "pending": discord.Color.from_rgb(230, 160, 55),
-        "approved": discord.Color.green(),
-        "rejected": discord.Color.red(),
-    }
-    labels = {
-        "pending": "Ожидает рассмотрения",
-        "approved": "Одобрено",
-        "rejected": "Отклонено",
-    }
+async def get_review_channel(guild: discord.Guild):
+    channel = guild.get_channel(REVIEW_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(REVIEW_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        raise RuntimeError("The configured review channel is not a text channel.")
+    return channel
+
+
+def get_applicant_id(embed: discord.Embed) -> int | None:
+    footer = embed.footer.text or ""
+    match = re.search(r"Applicant ID:\s*(\d+)", footer)
+    return int(match.group(1)) if match else None
+
+
+def make_application_embed(
+    applicant: discord.Member,
+    nickname: str,
+    static_id: str,
+    rank: str,
+    reason: str,
+) -> discord.Embed:
     embed = discord.Embed(
-        title=f"Заявление на увольнение #{row['id']}",
-        color=colors.get(status, discord.Color.dark_grey()),
-        timestamp=datetime.fromisoformat(row["created_at"])
+        title="Заявление на увольнение",
+        color=discord.Color.from_rgb(230, 145, 45),
+        timestamp=datetime.now(timezone.utc),
     )
-    user_line = f"**Пользователь:** <@{row['user_id']}>"
-    if member is not None:
-        joined_at = member.joined_at
-        if joined_at:
-            stamp = int(joined_at.timestamp())
-            user_line += f"\n**Присоединился:** <t:{stamp}:F> (<t:{stamp}:R>)"
-        embed.set_thumbnail(url=member.display_avatar.url)
-    embed.description = f"{user_line}\n**ID:** `{row['static_id']}`"
-
-    role_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(REVIEWER_ROLE_IDS))
-    header = (
-        "Начальнику Управления ГИБДД ГУ МВД по г. Москве и Московской области "
-        "Генерал-полковнику полиции"
-    )
-    if role_mentions:
-        header += f"\n{role_mentions}"
-    embed.add_field(name="", value=header, inline=False)
-    embed.add_field(name="", value=f"от **{row['rank']}** **{row['game_nick']}**", inline=False)
     embed.add_field(
-        name="Заявление",
-        value=(
-            f"Я, **{row['game_nick']}**, находящийся в звании **{row['rank']}**, "
-            f"служебное удостоверение №`{row['static_id']}` прошу Вас рассмотреть "
-            "моё заявление на увольнение из рядов Управления Государственной "
-            "Инспекции Безопасности Дорожного Движения по причине:\n"
-            f"{row['reason']}"
-        ),
-        inline=False
+        name="Пользователь Discord",
+        value=f"{applicant.mention} (`{applicant.id}`)",
+        inline=False,
     )
-    from zoneinfo import ZoneInfo
-    created_local = datetime.fromisoformat(row["created_at"]).astimezone(ZoneInfo("Europe/Moscow"))
-    embed.add_field(name="", value=f"**Дата:** {created_local:%d.%m.%Y}", inline=False)
-    embed.add_field(name="Статус", value=f"**{labels.get(status, status)}**", inline=False)
-    if row["reviewer_id"]:
-        embed.add_field(name="Рассмотрел", value=f"<@{row['reviewer_id']}>", inline=False)
-    embed.set_footer(text="ГИБДД | RMRP «Тверской»")
+    embed.add_field(name="Игровой никнейм", value=nickname, inline=True)
+    embed.add_field(name="Static ID", value=static_id, inline=True)
+    embed.add_field(name="Текущее звание", value=rank, inline=True)
+    embed.add_field(name="Причина увольнения", value=reason, inline=False)
+    embed.add_field(name="Статус", value="🟠 Ожидает рассмотрения", inline=False)
+    embed.set_footer(text=f"Система увольнений • Applicant ID: {applicant.id}")
     return embed
 
 
+async def update_review_message(
+    interaction: discord.Interaction,
+    status_text: str,
+    color: discord.Color,
+):
+    if not interaction.message or not interaction.message.embeds:
+        return
+    embed = interaction.message.embeds[0].copy()
+    # Replace the status field while preserving all application details.
+    status_index = next(
+        (i for i, field in enumerate(embed.fields) if field.name == "Статус"),
+        None,
+    )
+    if status_index is not None:
+        embed.set_field_at(
+            status_index,
+            name="Статус",
+            value=status_text,
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Статус", value=status_text, inline=False)
+    embed.color = color
+    await interaction.message.edit(embed=embed, view=None)
+
+
+async def notify_applicant(guild: discord.Guild, applicant_id: int, message: str):
+    try:
+        member = guild.get_member(applicant_id) or await guild.fetch_member(applicant_id)
+        await member.send(message)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        log.info("Could not send a DM to applicant %s", applicant_id)
+
+
+# ============================================================
+# APPLICATION MODAL
+# ============================================================
+
 class ResignationModal(discord.ui.Modal, title="Заявление на увольнение"):
-    game_nick = discord.ui.TextInput(
-        label="Игровой никнейм", placeholder="Например: Иван Иванов",
-        min_length=2, max_length=64
+    nickname = discord.ui.TextInput(
+        label="Игровой никнейм",
+        placeholder="Введите игровой никнейм",
+        min_length=2,
+        max_length=64,
     )
     static_id = discord.ui.TextInput(
-        label="Static ID", placeholder="Введите ваш Static ID",
-        min_length=1, max_length=24
+        label="Static ID",
+        placeholder="Введите ваш Static ID",
+        min_length=1,
+        max_length=32,
     )
     rank = discord.ui.TextInput(
-        label="Текущее звание", placeholder="Например: Младший сержант полиции",
-        min_length=2, max_length=80
+        label="Текущее звание",
+        placeholder="Например: Младший сержант полиции",
+        min_length=2,
+        max_length=100,
     )
     reason = discord.ui.TextInput(
-        label="Причина увольнения", style=discord.TextStyle.paragraph,
-        placeholder="Укажите причину увольнения...",
-        min_length=5, max_length=1000
+        label="Причина увольнения",
+        placeholder="Подробно укажите причину",
+        style=discord.TextStyle.paragraph,
+        min_length=3,
+        max_length=1000,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message(
-                "Подать заявление можно только на сервере.", ephemeral=True
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Подать заявление можно только на сервере.",
+                ephemeral=True,
             )
-        if not REVIEW_CHANNEL_ID:
-            return await interaction.response.send_message(
-                "Администратор ещё не настроил канал рассмотрения заявлений.", ephemeral=True
-            )
-        channel = interaction.guild.get_channel(REVIEW_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message(
-                "Канал рассмотрения не найден. Сообщите администрации.", ephemeral=True
-            )
-
-        created = datetime.now(timezone.utc).isoformat()
-        cur = db.execute(
-            """INSERT INTO applications
-            (guild_id,user_id,game_nick,static_id,rank,reason,created_at,member_joined_at)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (interaction.guild.id, interaction.user.id, str(self.game_nick),
-             str(self.static_id), str(self.rank), str(self.reason), created,
-             interaction.user.joined_at.isoformat() if interaction.user.joined_at else None)
-        )
-        app_id = cur.lastrowid
-        db.commit()
-        row = db.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
+            return
 
         try:
-            applicant_role_ping = " ".join(f"<@&{role_id}>" for role_id in sorted(REVIEWER_ROLE_IDS))
-            message = await channel.send(
-                content=applicant_role_ping or None,
-                embed=make_embed(row, member=interaction.user),
-                view=ReviewView(app_id),
-                allowed_mentions=discord.AllowedMentions(roles=True, users=False)
+            channel = await get_review_channel(interaction.guild)
+            embed = make_application_embed(
+                interaction.user,
+                str(self.nickname.value).strip(),
+                str(self.static_id.value).strip(),
+                str(self.rank.value).strip(),
+                str(self.reason.value).strip(),
             )
-            db.execute("UPDATE applications SET review_message_id=? WHERE id=?",
-                       (message.id, app_id))
-            db.commit()
-        except discord.Forbidden:
-            db.execute("UPDATE applications SET status='delivery_error' WHERE id=?", (app_id,))
-            db.commit()
-            return await interaction.response.send_message(
-                "Не удалось отправить заявление. У бота нет прав писать в канал рассмотрения.",
-                ephemeral=True
+            await channel.send(embed=embed, view=ReviewView())
+            await interaction.response.send_message(
+                "✅ Ваше заявление отправлено старшему составу на рассмотрение.",
+                ephemeral=True,
             )
+        except Exception as error:
+            log.exception("Failed to submit resignation application")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Не удалось отправить заявление: {str(error)[:800]}",
+                    ephemeral=True,
+                )
 
-        await interaction.response.send_message(
-            f"Заявление №**{app_id}** отправлено руководству на рассмотрение.",
-            ephemeral=True
-        )
 
+# ============================================================
+# PANEL BUTTON
+# ============================================================
 
 class ApplicationPanelView(discord.ui.View):
     def __init__(self):
@@ -210,150 +196,227 @@ class ApplicationPanelView(discord.ui.View):
     @discord.ui.button(
         label="Подать заявление на увольнение",
         style=discord.ButtonStyle.danger,
-        custom_id="resignation:open"
+        custom_id="lipton_resignation:open_form",
+        emoji="📝",
     )
-    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def open_form(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
         await interaction.response.send_modal(ResignationModal())
 
 
+# ============================================================
+# REVIEW BUTTONS
+# ============================================================
+
 class ReviewView(discord.ui.View):
-    def __init__(self, application_id: int):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.application_id = application_id
-        self.approve.custom_id = f"resignation:approve:{application_id}"
-        self.reject.custom_id = f"resignation:reject:{application_id}"
 
-    async def finish(self, interaction: discord.Interaction, approved: bool):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Недоступно вне сервера.", ephemeral=True)
-        if not reviewer_allowed(interaction.user):
-            return await interaction.response.send_message(
-                "У вас нет прав рассматривать заявления.", ephemeral=True
+    async def _check_reviewer(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Это действие доступно только на сервере.",
+                ephemeral=True,
             )
+            return False
+        if not has_reviewer_access(interaction.user):
+            await interaction.response.send_message(
+                "❌ Рассматривать заявления может только старший состав.",
+                ephemeral=True,
+            )
+            return False
+        return True
 
-        row = db.execute("SELECT * FROM applications WHERE id=?", (self.application_id,)).fetchone()
-        if not row:
-            return await interaction.response.send_message("Заявление не найдено.", ephemeral=True)
-        if row["status"] != "pending":
-            return await interaction.response.send_message(
-                "Это заявление уже рассмотрено.", ephemeral=True
+    @discord.ui.button(
+        label="Одобрить",
+        style=discord.ButtonStyle.success,
+        custom_id="lipton_resignation:approve",
+        emoji="✅",
+    )
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not await self._check_reviewer(interaction):
+            return
+
+        if not interaction.message or not interaction.message.embeds:
+            await interaction.response.send_message(
+                "Не удалось прочитать заявление.",
+                ephemeral=True,
             )
+            return
+
+        applicant_id = get_applicant_id(interaction.message.embeds[0])
+        if applicant_id is None:
+            await interaction.response.send_message(
+                "В заявлении не найден ID заявителя.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         guild = interaction.guild
-        member = guild.get_member(row["user_id"])
-        if approved:
-            if member is None:
-                try:
-                    member = await guild.fetch_member(row["user_id"])
-                except discord.NotFound:
-                    return await interaction.response.send_message(
-                        "Пользователь уже отсутствует на сервере. Заявление не изменено.",
-                        ephemeral=True
-                    )
-            terminated_role = guild.get_role(TERMINATED_ROLE_ID) if TERMINATED_ROLE_ID else None
-            if terminated_role is None:
-                return await interaction.response.send_message(
-                    "Не настроена роль «Уволен». Укажите TERMINATED_ROLE_ID в .env.",
-                    ephemeral=True
+        try:
+            member = guild.get_member(applicant_id) or await guild.fetch_member(applicant_id)
+            fired_role = guild.get_role(FIRED_ROLE_ID)
+            if fired_role is None:
+                raise RuntimeError("Роль «Уволен» не найдена. Проверь FIRED_ROLE_ID.")
+
+            bot_member = guild.me
+            if bot_member is None or not bot_member.guild_permissions.manage_roles:
+                raise RuntimeError("У бота нет разрешения Manage Roles.")
+
+            if fired_role.managed or fired_role >= bot_member.top_role or not fired_role.is_assignable():
+                raise RuntimeError(
+                    "Бот не может выдать роль «Уволен». Подними высшую роль бота "
+                    "выше роли «Уволен» и проверь разрешение Manage Roles."
                 )
-            me = guild.me
-            if me is None or not me.guild_permissions.manage_roles or not me.guild_permissions.manage_nicknames:
-                return await interaction.response.send_message(
-                    "Боту нужны права «Управлять ролями» и «Управлять никами».",
-                    ephemeral=True
-                )
-            if terminated_role >= me.top_role:
-                return await interaction.response.send_message(
-                    "Роль «Уволен» должна находиться ниже высшей роли бота.",
-                    ephemeral=True
-                )
-            removable = [r for r in member.roles if r != guild.default_role and r < me.top_role]
-            blocked = [r for r in member.roles if r != guild.default_role and r >= me.top_role]
-            try:
-                if removable:
-                    await member.remove_roles(*removable, reason=f"Увольнение по заявлению №{self.application_id}")
-                if terminated_role not in member.roles:
-                    await member.add_roles(terminated_role, reason=f"Увольнение по заявлению №{self.application_id}")
-                old_nick = member.nick or member.name
-                new_nick = old_nick if old_nick.startswith("[УВОЛЕН]") else f"[УВОЛЕН] {old_nick}"
-                await member.edit(nick=new_nick[:32], reason=f"Увольнение по заявлению №{self.application_id}")
-            except discord.Forbidden:
-                return await interaction.response.send_message(
-                    "Discord запретил изменить роли или ник. Проверьте иерархию ролей и права бота.",
-                    ephemeral=True
-                )
-            except discord.HTTPException as exc:
-                return await interaction.response.send_message(
-                    f"Discord не выполнил действие: {exc}", ephemeral=True
-                )
-            status = "approved"
-            extra = ""
+
+            # Remove every assignable role except @everyone and the final fired role.
+            roles_to_remove = [
+                role for role in member.roles
+                if not role.is_default()
+                and role.id != FIRED_ROLE_ID
+                and not role.managed
+            ]
+
+            blocked = [
+                role for role in roles_to_remove
+                if role >= bot_member.top_role or not role.is_assignable()
+            ]
             if blocked:
-                extra = "\n⚠️ Некоторые роли выше или на уровне роли бота снять не удалось."
-        else:
-            status = "rejected"
-            extra = ""
-
-        db.execute(
-            "UPDATE applications SET status=?, reviewer_id=?, reviewed_at=? WHERE id=?",
-            (status, interaction.user.id, datetime.now(timezone.utc).isoformat(), self.application_id)
-        )
-        db.commit()
-        updated = db.execute("SELECT * FROM applications WHERE id=?", (self.application_id,)).fetchone()
-        card_member = guild.get_member(row["user_id"])
-        await interaction.response.edit_message(embed=make_embed(updated, status, card_member), view=None)
-        if extra:
-            await interaction.followup.send(extra, ephemeral=True)
-
-        if LOG_CHANNEL_ID:
-            log_channel = guild.get_channel(LOG_CHANNEL_ID)
-            if isinstance(log_channel, discord.TextChannel):
-                action = "одобрил увольнение" if approved else "отклонил заявление"
-                await log_channel.send(
-                    f"Заявление №{self.application_id}: {interaction.user.mention} {action}. "
-                    f"Сотрудник: <@{row['user_id']}>."
+                names = ", ".join(f"{role.name} ({role.id})" for role in blocked)
+                raise RuntimeError(
+                    "Бот не может снять некоторые роли из-за иерархии Discord: "
+                    + names
+                    + ". Подними роль бота выше этих ролей."
                 )
 
-    @discord.ui.button(label="Одобрить", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.finish(interaction, True)
+            if roles_to_remove:
+                await member.remove_roles(
+                    *roles_to_remove,
+                    reason=f"Resignation approved by {interaction.user} ({interaction.user.id})",
+                )
 
-    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger)
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.finish(interaction, False)
+            if fired_role not in member.roles:
+                await member.add_roles(
+                    fired_role,
+                    reason=f"Resignation approved by {interaction.user} ({interaction.user.id})",
+                )
 
+            await update_review_message(
+                interaction,
+                f"✅ Одобрено — {interaction.user.mention}\nРоль «Уволен» выдана, доступные роли сняты.",
+                discord.Color.green(),
+            )
+            await notify_applicant(
+                guild,
+                applicant_id,
+                f"✅ Ваше заявление на увольнение одобрено на сервере **{guild.name}**. "
+                "Доступные служебные роли сняты, вам выдана роль «Уволен».",
+            )
+            await interaction.followup.send(
+                f"✅ Заявление одобрено. Роли участника {member.mention} обновлены.",
+                ephemeral=True,
+            )
 
-@bot.event
-async def on_ready():
-    # Register persistent panel and buttons for pending applications after restarts.
-    bot.add_view(ApplicationPanelView())
-    rows = db.execute(
-        "SELECT id FROM applications WHERE status='pending' AND review_message_id IS NOT NULL"
-    ).fetchall()
-    for row in rows:
-        bot.add_view(ReviewView(row["id"]))
-    try:
-        if GUILD_ID:
-            guild_obj = discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=guild_obj)
-            synced = await bot.tree.sync(guild=guild_obj)
-            log.info("Синхронизировано команд для сервера %s: %s", GUILD_ID, [cmd.name for cmd in synced])
-        else:
-            synced = await bot.tree.sync()
-            log.info("Синхронизировано глобальных команд: %s", [cmd.name for cmd in synced])
-    except Exception:
-        log.exception("Slash command sync failed")
-    log.info("Бот запущен как %s", bot.user)
+        except discord.NotFound:
+            await interaction.followup.send(
+                "❌ Заявитель больше не состоит на сервере.",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Discord запретил изменение ролей. Проверь Manage Roles и иерархию ролей.",
+                ephemeral=True,
+            )
+        except Exception as error:
+            log.exception("Failed to approve resignation")
+            await interaction.followup.send(
+                f"❌ Не удалось одобрить заявление: {str(error)[:1200]}",
+                ephemeral=True,
+            )
 
+    @discord.ui.button(
+        label="Отклонить",
+        style=discord.ButtonStyle.danger,
+        custom_id="lipton_resignation:reject",
+        emoji="❌",
+    )
+    async def reject(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not await self._check_reviewer(interaction):
+            return
 
-@bot.tree.command(name="setup_resignation", description="Create the resignation application panel")
-@app_commands.guild_only()
-async def resignation_panel(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not reviewer_allowed(interaction.user):
-        return await interaction.response.send_message(
-            "Эту панель может создавать только старший состав.",
-            ephemeral=True
+        if not interaction.message or not interaction.message.embeds:
+            await interaction.response.send_message(
+                "Не удалось прочитать заявление.",
+                ephemeral=True,
+            )
+            return
+
+        applicant_id = get_applicant_id(interaction.message.embeds[0])
+        if applicant_id is None:
+            await interaction.response.send_message(
+                "В заявлении не найден ID заявителя.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await update_review_message(
+            interaction,
+            f"❌ Отклонено — {interaction.user.mention}",
+            discord.Color.red(),
         )
+        await notify_applicant(
+            interaction.guild,
+            applicant_id,
+            f"❌ Ваше заявление на увольнение на сервере **{interaction.guild.name}** отклонено.",
+        )
+        await interaction.followup.send("Заявление отклонено.", ephemeral=True)
+
+
+# ============================================================
+# SLASH COMMAND — THE ONLY SETUP COMMAND
+# ============================================================
+
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@bot.tree.command(
+    name="setup_resignation",
+    description="Создать панель заявок на увольнение",
+)
+async def setup_resignation(interaction: discord.Interaction):
+    if interaction.guild_id != GUILD_ID:
+        await interaction.response.send_message(
+            "Эта команда предназначена для рабочего сервера.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not has_reviewer_access(interaction.user):
+        await interaction.response.send_message(
+            "❌ Установить панель может только старший состав.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "Выберите текстовый канал для панели.",
+            ephemeral=True,
+        )
+        return
+
     embed = discord.Embed(
         title="Расторжение контракта",
         description=(
@@ -365,10 +428,42 @@ async def resignation_panel(interaction: discord.Interaction):
             "• Текущее звание\n"
             "• Причина увольнения"
         ),
-        color=discord.Color.from_rgb(47, 91, 79)
+        color=discord.Color.from_rgb(48, 83, 73),
     )
-    embed.set_footer(text="ГИБДД | RMRP «Тверской»")
-    await interaction.response.send_message(embed=embed, view=ApplicationPanelView())
+    embed.set_footer(text="ГИБДД | RMRP «Тверской» • Система увольнений")
+
+    await interaction.channel.send(embed=embed, view=ApplicationPanelView())
+    await interaction.response.send_message(
+        "✅ Панель заявок на увольнение опубликована.",
+        ephemeral=True,
+    )
 
 
-bot.run(TOKEN)
+# ============================================================
+# STARTUP
+# ============================================================
+
+@bot.event
+async def on_ready():
+    log.info("Bot connected as %s (%s)", bot.user, bot.user.id)
+
+    # Persistent views keep existing buttons working after restarts.
+    if not getattr(bot, "_persistent_views_registered", False):
+        bot.add_view(ApplicationPanelView())
+        bot.add_view(ReviewView())
+        bot._persistent_views_registered = True
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        log.error("Configured guild %s was not found. Check bot invite and GUILD_ID.", GUILD_ID)
+        return
+
+    try:
+        synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        log.info("Synced %s guild slash command(s).", len(synced))
+    except Exception:
+        log.exception("Slash command synchronization failed")
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN, reconnect=True)
